@@ -110,7 +110,7 @@ configure_file(
 add_custom_command(TARGET srt_ai_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E create_symlink
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_worker.py
-    ${CMAKE_CURRENT_BINARY_DIR}/src/ai_worker.py
+    ${CMAKE_CURRENT_BINARY_DIR}/ai_worker.py
 )
 
 # ============================================================================

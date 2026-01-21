@@ -45,11 +45,12 @@ OPENCV_DEPS=(
     libxext6            # X11 extensions library
     libxrender1         # X11 Render extension
     libgomp1            # GNU OpenMP library (for parallel processing)
-    libgthread-2.0-0    # GLib threading library
     libavcodec-dev      # FFmpeg video codec library
     libavformat-dev     # FFmpeg format library
     libswscale-dev      # FFmpeg scaling library
 )
+
+apt-get install -y libopencv-dev
 
 apt-get install -y "${OPENCV_DEPS[@]}" || {
     echo -e "${RED}Failed to install OpenCV dependencies${NC}"
@@ -84,7 +85,7 @@ echo ""
 # ============================================================================
 echo -e "${YELLOW}[4/6] Installing SRT library...${NC}"
 
-apt-get install -y libsrt-dev libsrt1.5-gnutls || {
+apt-get install -y libsrt-openssl-dev libsrt-dev || {
     echo -e "${YELLOW}Warning: libsrt-dev not available in repositories${NC}"
     echo -e "${YELLOW}Attempting to build SRT from source...${NC}"
     
