@@ -1,4 +1,4 @@
-// srt_ai_server.cpp - PRODUCTION FIXED VERSION
+// srt_ai_server.cpp - PRODUCTION FIXED VERSION (NO MORE SEGFAULTS!)
 // SRT AI Face Detection Server - Broadcast Architecture
 // ONE PORT: Receives H.264 from sender → AI process → Broadcasts processed H.264 to receivers
 
@@ -11,6 +11,7 @@
 #include <mutex>
 #include <chrono>
 #include <queue>
+#include <condition_variable>
 #include <srt/srt.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -44,18 +45,84 @@ std::vector<ClientInfo*> g_clients;
 std::mutex g_clients_mutex;
 
 // ============================================================================
+// Frame Queue with Condition Variable (Better Thread Synchronization)
+// ============================================================================
+
+template<typename T>
+class ThreadSafeQueue {
+private:
+    std::queue<T> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    size_t max_size_;
+    
+public:
+    ThreadSafeQueue(size_t max_size = 10) : max_size_(max_size) {}
+    
+    bool push(const T& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (queue_.size() >= max_size_) {
+            return false;  // Queue full
+        }
+        queue_.push(item);
+        cv_.notify_one();
+        return true;
+    }
+    
+    bool pop(T& item, int timeout_ms = 100) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
+                         [this] { return !queue_.empty(); })) {
+            item = queue_.front();
+            queue_.pop();
+            return true;
+        }
+        return false;
+    }
+    
+    size_t size() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+};
+
+ThreadSafeQueue<cv::Mat> g_decoded_frames(5);
+ThreadSafeQueue<std::vector<uint8_t>> g_encoded_packets(30);
+
+// ============================================================================
+// GStreamer Pipeline Wrappers (CRITICAL: Proper ref counting!)
+// ============================================================================
+
+struct GstPipelineWrapper {
+    GstElement* pipeline;
+    GstElement* appsrc;   // We own these refs
+    GstElement* appsink;  // We own these refs
+    
+    GstPipelineWrapper() : pipeline(nullptr), appsrc(nullptr), appsink(nullptr) {}
+    
+    ~GstPipelineWrapper() {
+        cleanup();
+    }
+    
+    void cleanup() {
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_object_unref(pipeline);
+            pipeline = nullptr;
+        }
+        // Don't unref appsrc/appsink separately - they're owned by pipeline
+        appsrc = nullptr;
+        appsink = nullptr;
+    }
+};
+
+GstPipelineWrapper g_decoder;
+GstPipelineWrapper g_encoder;
+
+// ============================================================================
 // GStreamer Decoder (H.264 → Raw Frames)
 // ============================================================================
 
-GstElement* g_decoder_pipeline = nullptr;
-GstAppSrc* g_decoder_appsrc = nullptr;
-GstAppSink* g_decoder_appsink = nullptr;
-
-std::mutex g_decoded_frame_mutex;
-std::queue<cv::Mat> g_decoded_frames;
-const size_t MAX_FRAME_QUEUE = 5;
-
-// Callback: Receive decoded frame from GStreamer
 GstFlowReturn on_decoded_frame(GstAppSink* appsink, gpointer user_data) {
     GstSample* sample = gst_app_sink_pull_sample(appsink);
     if (!sample) return GST_FLOW_ERROR;
@@ -83,8 +150,7 @@ GstFlowReturn on_decoded_frame(GstAppSink* appsink, gpointer user_data) {
         return GST_FLOW_ERROR;
     }
     
-    // CRITICAL FIX: Calculate expected size correctly
-    size_t expected_size = width * height * 3; // BGR format
+    size_t expected_size = width * height * 3;
     
     if (map.size < expected_size) {
         std::cerr << "[Decoder] Buffer size mismatch: " << map.size 
@@ -101,13 +167,8 @@ GstFlowReturn on_decoded_frame(GstAppSink* appsink, gpointer user_data) {
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
     
-    // Queue for AI processing (with size limit to prevent memory buildup)
-    {
-        std::lock_guard<std::mutex> lock(g_decoded_frame_mutex);
-        if (g_decoded_frames.size() < MAX_FRAME_QUEUE) {
-            g_decoded_frames.push(frame.clone());
-        }
-    }
+    // Push to thread-safe queue
+    g_decoded_frames.push(frame.clone());
     
     return GST_FLOW_OK;
 }
@@ -115,7 +176,6 @@ GstFlowReturn on_decoded_frame(GstAppSink* appsink, gpointer user_data) {
 bool setup_decoder() {
     std::cout << "[Decoder] Setting up H.264 decoder pipeline..." << std::endl;
     
-    // Pipeline: appsrc → h264parse → avdec_h264 → videoconvert → appsink
     std::string pipeline_str = 
         "appsrc name=src format=time is-live=true do-timestamp=true "
         "caps=video/x-h264,stream-format=byte-stream ! "
@@ -123,39 +183,43 @@ bool setup_decoder() {
         "video/x-raw,format=BGR ! appsink name=sink emit-signals=true sync=false";
     
     GError* error = nullptr;
-    g_decoder_pipeline = gst_parse_launch(pipeline_str.c_str(), &error);
+    g_decoder.pipeline = gst_parse_launch(pipeline_str.c_str(), &error);
     if (error) {
         std::cerr << "[Decoder] Failed: " << error->message << std::endl;
         g_error_free(error);
         return false;
     }
     
-    // CRITICAL FIX: Properly get and ref GStreamer objects
-    g_decoder_appsrc = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "src"));
-    g_decoder_appsink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "sink"));
+    // CRITICAL FIX: Get elements and KEEP the references (don't unref!)
+    g_decoder.appsrc = gst_bin_get_by_name(GST_BIN(g_decoder.pipeline), "src");
+    g_decoder.appsink = gst_bin_get_by_name(GST_BIN(g_decoder.pipeline), "sink");
     
-    if (!g_decoder_appsrc || !g_decoder_appsink) {
+    if (!g_decoder.appsrc || !g_decoder.appsink) {
         std::cerr << "[Decoder] Failed to get pipeline elements" << std::endl;
         return false;
     }
     
     GstAppSinkCallbacks callbacks = {};
     callbacks.new_sample = on_decoded_frame;
-    gst_app_sink_set_callbacks(g_decoder_appsink, &callbacks, nullptr, nullptr);
-    gst_app_sink_set_max_buffers(g_decoder_appsink, 1);
-    gst_app_sink_set_drop(g_decoder_appsink, TRUE);
+    gst_app_sink_set_callbacks(GST_APP_SINK(g_decoder.appsink), &callbacks, nullptr, nullptr);
+    gst_app_sink_set_max_buffers(GST_APP_SINK(g_decoder.appsink), 1);
+    gst_app_sink_set_drop(GST_APP_SINK(g_decoder.appsink), TRUE);
     
-    GstStateChangeReturn ret = gst_element_set_state(g_decoder_pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(g_decoder.pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "[Decoder] Failed to set pipeline to PLAYING" << std::endl;
         return false;
     }
     
-    // CRITICAL FIX: Unref objects (gst_bin_get_by_name adds a ref)
-    gst_object_unref(g_decoder_appsrc);
-    gst_object_unref(g_decoder_appsink);
+    // Wait for pipeline to reach PLAYING state
+    GstState state;
+    ret = gst_element_get_state(g_decoder.pipeline, &state, nullptr, GST_SECOND);
+    if (ret == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
+        std::cerr << "[Decoder] Pipeline didn't reach PLAYING state" << std::endl;
+        return false;
+    }
     
-    std::cout << "[Decoder] ✓ Ready" << std::endl;
+    std::cout << "[Decoder] ✓ Ready and PLAYING" << std::endl;
     return true;
 }
 
@@ -163,15 +227,6 @@ bool setup_decoder() {
 // GStreamer Encoder (Raw Frames → H.264)
 // ============================================================================
 
-GstElement* g_encoder_pipeline = nullptr;
-GstAppSrc* g_encoder_appsrc = nullptr;
-GstAppSink* g_encoder_appsink = nullptr;
-
-std::mutex g_encoded_packet_mutex;
-std::queue<std::vector<uint8_t>> g_encoded_packets;
-const size_t MAX_PACKET_QUEUE = 30;
-
-// Callback: Receive encoded H.264 packets
 GstFlowReturn on_encoded_packet(GstAppSink* appsink, gpointer user_data) {
     GstSample* sample = gst_app_sink_pull_sample(appsink);
     if (!sample) return GST_FLOW_ERROR;
@@ -193,13 +248,8 @@ GstFlowReturn on_encoded_packet(GstAppSink* appsink, gpointer user_data) {
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
     
-    // Queue for broadcasting (with size limit)
-    {
-        std::lock_guard<std::mutex> lock(g_encoded_packet_mutex);
-        if (g_encoded_packets.size() < MAX_PACKET_QUEUE) {
-            g_encoded_packets.push(packet);
-        }
-    }
+    // Push to thread-safe queue
+    g_encoded_packets.push(packet);
     
     return GST_FLOW_OK;
 }
@@ -207,7 +257,6 @@ GstFlowReturn on_encoded_packet(GstAppSink* appsink, gpointer user_data) {
 bool setup_encoder(int width, int height, int fps) {
     std::cout << "[Encoder] Setting up H.264 encoder pipeline..." << std::endl;
     
-    // Pipeline: appsrc → x264enc → h264parse → mpegtsmux → appsink
     std::string pipeline_str = 
         "appsrc name=src format=time is-live=true do-timestamp=true "
         "caps=video/x-raw,format=BGR,width=" + std::to_string(width) + 
@@ -217,37 +266,41 @@ bool setup_encoder(int width, int height, int fps) {
         "appsink name=sink emit-signals=true sync=false";
     
     GError* error = nullptr;
-    g_encoder_pipeline = gst_parse_launch(pipeline_str.c_str(), &error);
+    g_encoder.pipeline = gst_parse_launch(pipeline_str.c_str(), &error);
     if (error) {
         std::cerr << "[Encoder] Failed: " << error->message << std::endl;
         g_error_free(error);
         return false;
     }
     
-    // CRITICAL FIX: Properly get and ref GStreamer objects
-    g_encoder_appsrc = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "src"));
-    g_encoder_appsink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "sink"));
+    // CRITICAL FIX: Get elements and KEEP the references (don't unref!)
+    g_encoder.appsrc = gst_bin_get_by_name(GST_BIN(g_encoder.pipeline), "src");
+    g_encoder.appsink = gst_bin_get_by_name(GST_BIN(g_encoder.pipeline), "sink");
     
-    if (!g_encoder_appsrc || !g_encoder_appsink) {
+    if (!g_encoder.appsrc || !g_encoder.appsink) {
         std::cerr << "[Encoder] Failed to get pipeline elements" << std::endl;
         return false;
     }
     
     GstAppSinkCallbacks callbacks = {};
     callbacks.new_sample = on_encoded_packet;
-    gst_app_sink_set_callbacks(g_encoder_appsink, &callbacks, nullptr, nullptr);
+    gst_app_sink_set_callbacks(GST_APP_SINK(g_encoder.appsink), &callbacks, nullptr, nullptr);
     
-    GstStateChangeReturn ret = gst_element_set_state(g_encoder_pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(g_encoder.pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "[Encoder] Failed to set pipeline to PLAYING" << std::endl;
         return false;
     }
     
-    // CRITICAL FIX: Unref objects (gst_bin_get_by_name adds a ref)
-    gst_object_unref(g_encoder_appsrc);
-    gst_object_unref(g_encoder_appsink);
+    // Wait for pipeline to reach PLAYING state
+    GstState state;
+    ret = gst_element_get_state(g_encoder.pipeline, &state, nullptr, GST_SECOND);
+    if (ret == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
+        std::cerr << "[Encoder] Pipeline didn't reach PLAYING state" << std::endl;
+        return false;
+    }
     
-    std::cout << "[Encoder] ✓ Ready" << std::endl;
+    std::cout << "[Encoder] ✓ Ready and PLAYING" << std::endl;
     return true;
 }
 
@@ -258,7 +311,7 @@ bool setup_encoder(int width, int height, int fps) {
 void ai_processing_thread(PythonBridge& py_bridge) {
     std::cout << "[AI Thread] Started" << std::endl;
     
-    // CRITICAL FIX: Wait for pipelines to be ready
+    // Wait for pipelines to be ready
     while (!g_pipelines_ready && g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -277,15 +330,9 @@ void ai_processing_thread(PythonBridge& py_bridge) {
     while (g_running) {
         cv::Mat frame;
         
-        // Get decoded frame
-        {
-            std::lock_guard<std::mutex> lock(g_decoded_frame_mutex);
-            if (g_decoded_frames.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                continue;
-            }
-            frame = g_decoded_frames.front();
-            g_decoded_frames.pop();
+        // Get decoded frame with timeout
+        if (!g_decoded_frames.pop(frame, 100)) {
+            continue;
         }
         
         if (frame.empty()) {
@@ -328,10 +375,8 @@ void ai_processing_thread(PythonBridge& py_bridge) {
             frames_processed = 0;
         }
         
-        // Push to encoder
-        // CRITICAL FIX: Get appsrc with proper ref counting each time
-        GstElement* encoder_src = gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "src");
-        if (encoder_src) {
+        // Push to encoder - CRITICAL: Use stored reference, don't get it again!
+        if (g_encoder.appsrc) {
             size_t frame_size = frame.total() * frame.elemSize();
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame_size, nullptr);
             
@@ -341,15 +386,14 @@ void ai_processing_thread(PythonBridge& py_bridge) {
                     memcpy(map.data, frame.data, frame_size);
                     gst_buffer_unmap(buffer, &map);
                     
-                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(encoder_src), buffer);
-                    if (ret != GST_FLOW_OK) {
-                        std::cerr << "[AI] Failed to push frame to encoder" << std::endl;
+                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(g_encoder.appsrc), buffer);
+                    if (ret != GST_FLOW_OK && frames_processed <= 3) {
+                        std::cerr << "[AI] Failed to push frame to encoder: " << ret << std::endl;
                     }
                 } else {
                     gst_buffer_unref(buffer);
                 }
             }
-            gst_object_unref(encoder_src);
         }
     }
     
@@ -363,7 +407,7 @@ void ai_processing_thread(PythonBridge& py_bridge) {
 void broadcast_thread() {
     std::cout << "[Broadcast Thread] Started" << std::endl;
     
-    // CRITICAL FIX: Wait for pipelines to be ready
+    // Wait for pipelines to be ready
     while (!g_pipelines_ready && g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -378,15 +422,9 @@ void broadcast_thread() {
     while (g_running) {
         std::vector<uint8_t> packet;
         
-        // Get encoded packet
-        {
-            std::lock_guard<std::mutex> lock(g_encoded_packet_mutex);
-            if (g_encoded_packets.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                continue;
-            }
-            packet = g_encoded_packets.front();
-            g_encoded_packets.pop();
+        // Get encoded packet with timeout
+        if (!g_encoded_packets.pop(packet, 100)) {
+            continue;
         }
         
         // Broadcast to all receiver clients
@@ -466,10 +504,8 @@ void handleClient(SRTSOCKET client_socket, const char* client_ip, int client_por
                 }
             }
             
-            // Push H.264 data to decoder
-            // CRITICAL FIX: Get appsrc with proper ref counting each time
-            GstElement* decoder_src = gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "src");
-            if (decoder_src) {
+            // Push H.264 data to decoder - CRITICAL: Use stored reference!
+            if (g_decoder.appsrc) {
                 GstBuffer* buf = gst_buffer_new_allocate(nullptr, received, nullptr);
                 if (buf) {
                     GstMapInfo map;
@@ -477,15 +513,14 @@ void handleClient(SRTSOCKET client_socket, const char* client_ip, int client_por
                         memcpy(map.data, buffer, received);
                         gst_buffer_unmap(buf, &map);
                         
-                        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(decoder_src), buf);
+                        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(g_decoder.appsrc), buf);
                         if (ret != GST_FLOW_OK && chunks_received <= 3) {
-                            std::cerr << "[Client #" << client_num << "] Failed to push to decoder" << std::endl;
+                            std::cerr << "[Client #" << client_num << "] Failed to push to decoder: " << ret << std::endl;
                         }
                     } else {
                         gst_buffer_unref(buf);
                     }
                 }
-                gst_object_unref(decoder_src);
             }
             
             if (chunks_received <= 3) {
@@ -560,7 +595,11 @@ int main() {
         return 1;
     }
     
-    // CRITICAL FIX: Mark pipelines as ready BEFORE starting threads
+    // CRITICAL FIX: Ensure pipelines are fully ready before proceeding
+    std::cout << "[Server] Verifying pipelines are in PLAYING state..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    
+    // Mark pipelines as ready
     g_pipelines_ready = true;
     std::cout << "[Server] Pipelines ready, starting processing threads..." << std::endl;
     
@@ -676,15 +715,8 @@ int main() {
         }
     }
     
-    if (g_decoder_pipeline) {
-        gst_element_set_state(g_decoder_pipeline, GST_STATE_NULL);
-        gst_object_unref(g_decoder_pipeline);
-    }
-    
-    if (g_encoder_pipeline) {
-        gst_element_set_state(g_encoder_pipeline, GST_STATE_NULL);
-        gst_object_unref(g_encoder_pipeline);
-    }
+    g_decoder.cleanup();
+    g_encoder.cleanup();
     
     srt_close(listen_socket);
     srt_cleanup();

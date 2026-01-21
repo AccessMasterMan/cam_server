@@ -1,4 +1,4 @@
-// python_bridge.cpp - Zero-Copy Python Bridge Implementation (PRODUCTION FIXED)
+// python_bridge.cpp - Zero-Copy Python Bridge Implementation (STABLE & FIXED)
 
 #include "python_bridge.h"
 #include <iostream>
@@ -42,11 +42,14 @@ bool PythonBridge::initialize(int det_size) {
         return false;
     }
     
-    // CRITICAL FIX: Initialize threading support and release GIL
-    // This allows other threads to call Python code safely
+    // CRITICAL: Initialize threading support (deprecated but still works in Python 3.10)
+    // This enables GIL support which is needed for multi-threaded access
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     if (!PyEval_ThreadsInitialized()) {
         PyEval_InitThreads();
     }
+    #pragma GCC diagnostic pop
     
     import_array1(false);
     
@@ -111,8 +114,9 @@ bool PythonBridge::initialize(int det_size) {
         std::cout << "[PythonBridge] ✓ AI engine initialized successfully!" << std::endl;
     }
     
-    // CRITICAL FIX: Release GIL so other threads can use Python
-    PyEval_SaveThread();
+    // CRITICAL FIX: Don't call PyEval_SaveThread() here!
+    // Let GILGuard manage the GIL in each function call instead.
+    // This is more stable and matches the old working implementation.
     
     initialized_ = true;
     return true;
@@ -131,16 +135,23 @@ PyObject* PythonBridge::cvMatToNumPy(const cv::Mat& frame) {
     
     npy_intp dims[3] = {frame.rows, frame.cols, frame.channels()};
     
-    // CRITICAL FIX: Make a COPY of the data to avoid use-after-free
-    // Zero-copy is unsafe when frames are being processed asynchronously
-    PyObject* array = PyArray_SimpleNew(3, dims, NPY_UINT8);
+    // OLD APPROACH (STABLE): Zero-copy using shared memory
+    // Create NumPy array that SHARES memory with cv::Mat
+    PyObject* array = PyArray_SimpleNewFromData(
+        3,                  // 3D array
+        dims,              // Dimensions
+        NPY_UINT8,         // Data type
+        frame.data         // Pointer to data (SHARED!)
+    );
+    
     if (!array) {
-        last_error_ = "Failed to create NumPy array";
+        last_error_ = "Failed to create NumPy array from cv::Mat";
         return nullptr;
     }
     
-    void* array_data = PyArray_DATA((PyArrayObject*)array);
-    memcpy(array_data, frame.data, frame.total() * frame.elemSize());
+    // CRITICAL: Tell NumPy it doesn't own this memory
+    // Without this, NumPy might try to free frame.data when the array is destroyed!
+    PyArray_CLEARFLAGS((PyArrayObject*)array, NPY_ARRAY_OWNDATA);
     
     return array;
 }
