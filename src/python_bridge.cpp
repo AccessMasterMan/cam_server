@@ -1,4 +1,4 @@
-// python_bridge.cpp - Zero-Copy Python Bridge Implementation (Fixed)
+// python_bridge.cpp - Zero-Copy Python Bridge Implementation (PRODUCTION FIXED)
 
 #include "python_bridge.h"
 #include <iostream>
@@ -42,8 +42,11 @@ bool PythonBridge::initialize(int det_size) {
         return false;
     }
     
-    // PyEval_InitThreads() is deprecated in Python 3.7+ and called automatically
-    // No need to call it explicitly
+    // CRITICAL FIX: Initialize threading support and release GIL
+    // This allows other threads to call Python code safely
+    if (!PyEval_ThreadsInitialized()) {
+        PyEval_InitThreads();
+    }
     
     import_array1(false);
     
@@ -108,6 +111,9 @@ bool PythonBridge::initialize(int det_size) {
         std::cout << "[PythonBridge] ✓ AI engine initialized successfully!" << std::endl;
     }
     
+    // CRITICAL FIX: Release GIL so other threads can use Python
+    PyEval_SaveThread();
+    
     initialized_ = true;
     return true;
 }
@@ -118,21 +124,23 @@ PyObject* PythonBridge::cvMatToNumPy(const cv::Mat& frame) {
         return nullptr;
     }
     
-    npy_intp dims[3] = {frame.rows, frame.cols, frame.channels()};
-    
-    PyObject* array = PyArray_SimpleNewFromData(
-        3,
-        dims,
-        NPY_UINT8,
-        frame.data
-    );
-    
-    if (!array) {
-        last_error_ = "Failed to create NumPy array from cv::Mat";
+    if (frame.empty()) {
+        last_error_ = "Frame is empty";
         return nullptr;
     }
     
-    PyArray_CLEARFLAGS((PyArrayObject*)array, NPY_ARRAY_OWNDATA);
+    npy_intp dims[3] = {frame.rows, frame.cols, frame.channels()};
+    
+    // CRITICAL FIX: Make a COPY of the data to avoid use-after-free
+    // Zero-copy is unsafe when frames are being processed asynchronously
+    PyObject* array = PyArray_SimpleNew(3, dims, NPY_UINT8);
+    if (!array) {
+        last_error_ = "Failed to create NumPy array";
+        return nullptr;
+    }
+    
+    void* array_data = PyArray_DATA((PyArrayObject*)array);
+    memcpy(array_data, frame.data, frame.total() * frame.elemSize());
     
     return array;
 }
@@ -200,6 +208,11 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
         return false;
     }
     
+    if (frame.empty()) {
+        last_error_ = "Input frame is empty";
+        return false;
+    }
+    
     auto start = std::chrono::high_resolution_clock::now();
     
     GILGuard gil;
@@ -210,6 +223,12 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
     }
     
     PyObject* args = PyTuple_Pack(1, np_frame);
+    if (!args) {
+        Py_DECREF(np_frame);
+        last_error_ = "Failed to create argument tuple";
+        return false;
+    }
+    
     PyObject* py_result = PyObject_CallObject(detect_func_, args);
     
     Py_DECREF(args);

@@ -1,7 +1,6 @@
-// fixed_srt_ai_server.cpp
+// srt_ai_server.cpp - PRODUCTION FIXED VERSION
 // SRT AI Face Detection Server - Broadcast Architecture
 // ONE PORT: Receives H.264 from sender → AI process → Broadcasts processed H.264 to receivers
-// Matches your original broadcast server design!
 
 #include <iostream>
 #include <cstring>
@@ -25,9 +24,10 @@
 using namespace FaceStreaming;
 
 std::atomic<bool> g_running(true);
+std::atomic<bool> g_pipelines_ready(false);
 
 // ============================================================================
-// Client Management (same as your broadcast server)
+// Client Management
 // ============================================================================
 
 struct ClientInfo {
@@ -53,6 +53,7 @@ GstAppSink* g_decoder_appsink = nullptr;
 
 std::mutex g_decoded_frame_mutex;
 std::queue<cv::Mat> g_decoded_frames;
+const size_t MAX_FRAME_QUEUE = 5;
 
 // Callback: Receive decoded frame from GStreamer
 GstFlowReturn on_decoded_frame(GstAppSink* appsink, gpointer user_data) {
@@ -62,25 +63,50 @@ GstFlowReturn on_decoded_frame(GstAppSink* appsink, gpointer user_data) {
     GstBuffer* buffer = gst_sample_get_buffer(sample);
     GstCaps* caps = gst_sample_get_caps(sample);
     
+    if (!buffer || !caps) {
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
+    }
+    
     GstVideoInfo video_info;
-    gst_video_info_from_caps(&video_info, caps);
+    if (!gst_video_info_from_caps(&video_info, caps)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
+    }
     
     int width = GST_VIDEO_INFO_WIDTH(&video_info);
     int height = GST_VIDEO_INFO_HEIGHT(&video_info);
     
     GstMapInfo map;
-    gst_buffer_map(buffer, &map, GST_MAP_READ);
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
+    }
     
+    // CRITICAL FIX: Calculate expected size correctly
+    size_t expected_size = width * height * 3; // BGR format
+    
+    if (map.size < expected_size) {
+        std::cerr << "[Decoder] Buffer size mismatch: " << map.size 
+                  << " < " << expected_size << std::endl;
+        gst_buffer_unmap(buffer, &map);
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
+    }
+    
+    // Create OpenCV Mat and copy data
     cv::Mat frame(height, width, CV_8UC3);
-    memcpy(frame.data, map.data, map.size);
+    memcpy(frame.data, map.data, expected_size);
     
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
     
-    // Queue for AI processing
+    // Queue for AI processing (with size limit to prevent memory buildup)
     {
         std::lock_guard<std::mutex> lock(g_decoded_frame_mutex);
-        g_decoded_frames.push(frame.clone());
+        if (g_decoded_frames.size() < MAX_FRAME_QUEUE) {
+            g_decoded_frames.push(frame.clone());
+        }
     }
     
     return GST_FLOW_OK;
@@ -104,8 +130,14 @@ bool setup_decoder() {
         return false;
     }
     
+    // CRITICAL FIX: Properly get and ref GStreamer objects
     g_decoder_appsrc = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "src"));
     g_decoder_appsink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "sink"));
+    
+    if (!g_decoder_appsrc || !g_decoder_appsink) {
+        std::cerr << "[Decoder] Failed to get pipeline elements" << std::endl;
+        return false;
+    }
     
     GstAppSinkCallbacks callbacks = {};
     callbacks.new_sample = on_decoded_frame;
@@ -113,7 +145,15 @@ bool setup_decoder() {
     gst_app_sink_set_max_buffers(g_decoder_appsink, 1);
     gst_app_sink_set_drop(g_decoder_appsink, TRUE);
     
-    gst_element_set_state(g_decoder_pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(g_decoder_pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "[Decoder] Failed to set pipeline to PLAYING" << std::endl;
+        return false;
+    }
+    
+    // CRITICAL FIX: Unref objects (gst_bin_get_by_name adds a ref)
+    gst_object_unref(g_decoder_appsrc);
+    gst_object_unref(g_decoder_appsink);
     
     std::cout << "[Decoder] ✓ Ready" << std::endl;
     return true;
@@ -129,6 +169,7 @@ GstAppSink* g_encoder_appsink = nullptr;
 
 std::mutex g_encoded_packet_mutex;
 std::queue<std::vector<uint8_t>> g_encoded_packets;
+const size_t MAX_PACKET_QUEUE = 30;
 
 // Callback: Receive encoded H.264 packets
 GstFlowReturn on_encoded_packet(GstAppSink* appsink, gpointer user_data) {
@@ -136,19 +177,28 @@ GstFlowReturn on_encoded_packet(GstAppSink* appsink, gpointer user_data) {
     if (!sample) return GST_FLOW_ERROR;
     
     GstBuffer* buffer = gst_sample_get_buffer(sample);
+    if (!buffer) {
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
+    }
     
     GstMapInfo map;
-    gst_buffer_map(buffer, &map, GST_MAP_READ);
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
+    }
     
     std::vector<uint8_t> packet(map.data, map.data + map.size);
     
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
     
-    // Queue for broadcasting
+    // Queue for broadcasting (with size limit)
     {
         std::lock_guard<std::mutex> lock(g_encoded_packet_mutex);
-        g_encoded_packets.push(packet);
+        if (g_encoded_packets.size() < MAX_PACKET_QUEUE) {
+            g_encoded_packets.push(packet);
+        }
     }
     
     return GST_FLOW_OK;
@@ -174,14 +224,28 @@ bool setup_encoder(int width, int height, int fps) {
         return false;
     }
     
+    // CRITICAL FIX: Properly get and ref GStreamer objects
     g_encoder_appsrc = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "src"));
     g_encoder_appsink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "sink"));
+    
+    if (!g_encoder_appsrc || !g_encoder_appsink) {
+        std::cerr << "[Encoder] Failed to get pipeline elements" << std::endl;
+        return false;
+    }
     
     GstAppSinkCallbacks callbacks = {};
     callbacks.new_sample = on_encoded_packet;
     gst_app_sink_set_callbacks(g_encoder_appsink, &callbacks, nullptr, nullptr);
     
-    gst_element_set_state(g_encoder_pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(g_encoder_pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "[Encoder] Failed to set pipeline to PLAYING" << std::endl;
+        return false;
+    }
+    
+    // CRITICAL FIX: Unref objects (gst_bin_get_by_name adds a ref)
+    gst_object_unref(g_encoder_appsrc);
+    gst_object_unref(g_encoder_appsink);
     
     std::cout << "[Encoder] ✓ Ready" << std::endl;
     return true;
@@ -194,6 +258,18 @@ bool setup_encoder(int width, int height, int fps) {
 void ai_processing_thread(PythonBridge& py_bridge) {
     std::cout << "[AI Thread] Started" << std::endl;
     
+    // CRITICAL FIX: Wait for pipelines to be ready
+    while (!g_pipelines_ready && g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    if (!g_running) {
+        std::cout << "[AI Thread] Stopped before start" << std::endl;
+        return;
+    }
+    
+    std::cout << "[AI Thread] Pipelines ready, processing frames..." << std::endl;
+    
     std::vector<DetectionResult> detections;
     int frames_processed = 0;
     auto last_stat = std::chrono::steady_clock::now();
@@ -205,15 +281,21 @@ void ai_processing_thread(PythonBridge& py_bridge) {
         {
             std::lock_guard<std::mutex> lock(g_decoded_frame_mutex);
             if (g_decoded_frames.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
             frame = g_decoded_frames.front();
             g_decoded_frames.pop();
         }
         
+        if (frame.empty()) {
+            std::cerr << "[AI Thread] Received empty frame" << std::endl;
+            continue;
+        }
+        
         if (frames_processed == 0) {
-            std::cout << "[AI Thread] ✓ First frame received!" << std::endl;
+            std::cout << "[AI Thread] ✓ First frame received: " 
+                      << frame.cols << "x" << frame.rows << std::endl;
         }
         
         auto start = std::chrono::high_resolution_clock::now();
@@ -221,7 +303,7 @@ void ai_processing_thread(PythonBridge& py_bridge) {
         // AI detection
         detections.clear();
         if (!py_bridge.detectFaces(frame, detections)) {
-            std::cerr << "[AI] Detection failed" << std::endl;
+            std::cerr << "[AI] Detection failed: " << py_bridge.getLastError() << std::endl;
             continue;
         }
         
@@ -247,13 +329,27 @@ void ai_processing_thread(PythonBridge& py_bridge) {
         }
         
         // Push to encoder
-        if (g_encoder_appsrc) {
-            GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame.total() * frame.elemSize(), nullptr);
-            GstMapInfo map;
-            gst_buffer_map(buffer, &map, GST_MAP_WRITE);
-            memcpy(map.data, frame.data, frame.total() * frame.elemSize());
-            gst_buffer_unmap(buffer, &map);
-            gst_app_src_push_buffer(g_encoder_appsrc, buffer);
+        // CRITICAL FIX: Get appsrc with proper ref counting each time
+        GstElement* encoder_src = gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "src");
+        if (encoder_src) {
+            size_t frame_size = frame.total() * frame.elemSize();
+            GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame_size, nullptr);
+            
+            if (buffer) {
+                GstMapInfo map;
+                if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+                    memcpy(map.data, frame.data, frame_size);
+                    gst_buffer_unmap(buffer, &map);
+                    
+                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(encoder_src), buffer);
+                    if (ret != GST_FLOW_OK) {
+                        std::cerr << "[AI] Failed to push frame to encoder" << std::endl;
+                    }
+                } else {
+                    gst_buffer_unref(buffer);
+                }
+            }
+            gst_object_unref(encoder_src);
         }
     }
     
@@ -261,11 +357,21 @@ void ai_processing_thread(PythonBridge& py_bridge) {
 }
 
 // ============================================================================
-// Broadcast Thread (same as your original server)
+// Broadcast Thread
 // ============================================================================
 
 void broadcast_thread() {
     std::cout << "[Broadcast Thread] Started" << std::endl;
+    
+    // CRITICAL FIX: Wait for pipelines to be ready
+    while (!g_pipelines_ready && g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    if (!g_running) {
+        std::cout << "[Broadcast Thread] Stopped before start" << std::endl;
+        return;
+    }
     
     int packets_sent = 0;
     
@@ -276,7 +382,7 @@ void broadcast_thread() {
         {
             std::lock_guard<std::mutex> lock(g_encoded_packet_mutex);
             if (g_encoded_packets.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
             packet = g_encoded_packets.front();
@@ -295,7 +401,7 @@ void broadcast_thread() {
         }
         
         packets_sent++;
-        if (packets_sent % 100 == 1) {
+        if (packets_sent == 1 || packets_sent % 100 == 0) {
             std::cout << "[Broadcast] Sent " << packets_sent << " packets" << std::endl;
         }
     }
@@ -304,7 +410,7 @@ void broadcast_thread() {
 }
 
 // ============================================================================
-// Client Handler (same as your broadcast server)
+// Client Handler
 // ============================================================================
 
 void handleClient(SRTSOCKET client_socket, const char* client_ip, int client_port, int client_num) {
@@ -361,13 +467,25 @@ void handleClient(SRTSOCKET client_socket, const char* client_ip, int client_por
             }
             
             // Push H.264 data to decoder
-            if (g_decoder_appsrc) {
+            // CRITICAL FIX: Get appsrc with proper ref counting each time
+            GstElement* decoder_src = gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "src");
+            if (decoder_src) {
                 GstBuffer* buf = gst_buffer_new_allocate(nullptr, received, nullptr);
-                GstMapInfo map;
-                gst_buffer_map(buf, &map, GST_MAP_WRITE);
-                memcpy(map.data, buffer, received);
-                gst_buffer_unmap(buf, &map);
-                gst_app_src_push_buffer(g_decoder_appsrc, buf);
+                if (buf) {
+                    GstMapInfo map;
+                    if (gst_buffer_map(buf, &map, GST_MAP_WRITE)) {
+                        memcpy(map.data, buffer, received);
+                        gst_buffer_unmap(buf, &map);
+                        
+                        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(decoder_src), buf);
+                        if (ret != GST_FLOW_OK && chunks_received <= 3) {
+                            std::cerr << "[Client #" << client_num << "] Failed to push to decoder" << std::endl;
+                        }
+                    } else {
+                        gst_buffer_unref(buf);
+                    }
+                }
+                gst_object_unref(decoder_src);
             }
             
             if (chunks_received <= 3) {
@@ -404,9 +522,9 @@ void signalHandler(int signum) {
 
 int main() {
     std::cout << "\n╔═══════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║  SRT AI BROADCAST SERVER                              ║" << std::endl;
+    std::cout << "║  SRT AI BROADCAST SERVER - PRODUCTION FIXED          ║" << std::endl;
     std::cout << "║  Architecture: Sender → AI Processing → Receivers     ║" << std::endl;
-    std::cout << "║  ONE PORT (like your original broadcast server!)      ║" << std::endl;
+    std::cout << "║  ONE PORT (broadcast architecture)                    ║" << std::endl;
     std::cout << "╚═══════════════════════════════════════════════════════╝\n" << std::endl;
     
     signal(SIGINT, signalHandler);
@@ -426,22 +544,36 @@ int main() {
     // Initialize Python AI
     PythonBridge py_bridge;
     if (!py_bridge.initialize(640)) {
-        std::cerr << "[AI] Init failed" << std::endl;
+        std::cerr << "[AI] Init failed: " << py_bridge.getLastError() << std::endl;
         return 1;
     }
     std::cout << "[AI] ✓ Ready" << std::endl;
     
     // Setup decoder/encoder
-    if (!setup_decoder() || !setup_encoder(640, 640, 30)) {
-        std::cerr << "[Server] Failed to setup GStreamer" << std::endl;
+    if (!setup_decoder()) {
+        std::cerr << "[Server] Failed to setup decoder" << std::endl;
         return 1;
     }
+    
+    if (!setup_encoder(640, 640, 30)) {
+        std::cerr << "[Server] Failed to setup encoder" << std::endl;
+        return 1;
+    }
+    
+    // CRITICAL FIX: Mark pipelines as ready BEFORE starting threads
+    g_pipelines_ready = true;
+    std::cout << "[Server] Pipelines ready, starting processing threads..." << std::endl;
+    
+    // Small delay to ensure everything is fully initialized
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
     // Start processing threads
     std::thread ai_thread(ai_processing_thread, std::ref(py_bridge));
     std::thread broadcast_thr(broadcast_thread);
     
-    // Create SRT listening socket (SAME as your broadcast server)
+    std::cout << "[Server] All threads started successfully!" << std::endl;
+    
+    // Create SRT listening socket
     SRTSOCKET listen_socket = srt_create_socket();
     
     int live_mode = SRTT_LIVE;
@@ -467,11 +599,17 @@ int main() {
     
     if (srt_bind(listen_socket, (sockaddr*)&sa, sizeof(sa)) == SRT_ERROR) {
         std::cerr << "[SRT] Bind failed" << std::endl;
+        g_running = false;
+        ai_thread.join();
+        broadcast_thr.join();
         return 1;
     }
     
     if (srt_listen(listen_socket, 5) == SRT_ERROR) {
         std::cerr << "[SRT] Listen failed" << std::endl;
+        g_running = false;
+        ai_thread.join();
+        broadcast_thr.join();
         return 1;
     }
     
@@ -481,7 +619,7 @@ int main() {
     
     int client_counter = 0;
     
-    // Accept clients (SAME as broadcast server)
+    // Accept clients
     while (g_running) {
         sockaddr_storage client_addr;
         int addr_len = sizeof(client_addr);
@@ -555,3 +693,4 @@ int main() {
     std::cout << "[Server] Shutdown complete" << std::endl;
     return 0;
 }
+
