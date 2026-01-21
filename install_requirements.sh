@@ -84,6 +84,8 @@ echo ""
 # SRT (Secure Reliable Transport) Library
 # ============================================================================
 echo -e "${YELLOW}[4/6] Installing SRT library...${NC}"
+apt-get update
+apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
 apt-get install -y libsrt-openssl-dev libsrt-dev || {
     echo -e "${YELLOW}Warning: libsrt-dev not available in repositories${NC}"

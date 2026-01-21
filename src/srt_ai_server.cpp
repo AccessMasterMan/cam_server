@@ -18,6 +18,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
 #include <opencv2/opencv.hpp>
 #include "python_bridge.h"
 
@@ -106,7 +107,8 @@ bool setup_decoder() {
     g_decoder_appsrc = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "src"));
     g_decoder_appsink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(g_decoder_pipeline), "sink"));
     
-    GstAppSinkCallbacks callbacks = {nullptr, nullptr, on_decoded_frame};
+    GstAppSinkCallbacks callbacks = {};
+    callbacks.new_sample = on_decoded_frame;
     gst_app_sink_set_callbacks(g_decoder_appsink, &callbacks, nullptr, nullptr);
     gst_app_sink_set_max_buffers(g_decoder_appsink, 1);
     gst_app_sink_set_drop(g_decoder_appsink, TRUE);
@@ -175,7 +177,8 @@ bool setup_encoder(int width, int height, int fps) {
     g_encoder_appsrc = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "src"));
     g_encoder_appsink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(g_encoder_pipeline), "sink"));
     
-    GstAppSinkCallbacks callbacks = {nullptr, nullptr, on_encoded_packet};
+    GstAppSinkCallbacks callbacks = {};
+    callbacks.new_sample = on_encoded_packet;
     gst_app_sink_set_callbacks(g_encoder_appsink, &callbacks, nullptr, nullptr);
     
     gst_element_set_state(g_encoder_pipeline, GST_STATE_PLAYING);

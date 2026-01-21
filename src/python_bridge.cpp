@@ -1,5 +1,4 @@
-// src/python_bridge.cpp
-// Zero-Copy Python Bridge Implementation
+// python_bridge.cpp - Zero-Copy Python Bridge Implementation (Fixed)
 
 #include "python_bridge.h"
 #include <iostream>
@@ -7,10 +6,6 @@
 #include <chrono>
 
 namespace FaceStreaming {
-
-// ============================================================================
-// PythonBridge Implementation
-// ============================================================================
 
 PythonBridge::PythonBridge()
     : module_(nullptr)
@@ -24,12 +19,11 @@ PythonBridge::PythonBridge()
 
 PythonBridge::~PythonBridge() {
     if (initialized_) {
-        GILGuard gil;  // Acquire GIL before cleanup
+        GILGuard gil;
         
         Py_XDECREF(detect_func_);
         Py_XDECREF(module_);
         
-        // Finalize Python interpreter
         if (Py_IsInitialized()) {
             Py_Finalize();
         }
@@ -41,7 +35,6 @@ bool PythonBridge::initialize(int det_size) {
     
     std::cout << "[PythonBridge] Initializing Python environment..." << std::endl;
     
-    // Initialize Python interpreter
     Py_Initialize();
     
     if (!Py_IsInitialized()) {
@@ -49,16 +42,14 @@ bool PythonBridge::initialize(int det_size) {
         return false;
     }
     
-    // Initialize threading support (enables GIL)
-    PyEval_InitThreads();
+    // PyEval_InitThreads() is deprecated in Python 3.7+ and called automatically
+    // No need to call it explicitly
     
-    // Import NumPy C API
-    import_array1(false);  // Returns false on error
+    import_array1(false);
     
     std::cout << "[PythonBridge] Python " << Py_GetVersion() << std::endl;
     std::cout << "[PythonBridge] NumPy C API imported" << std::endl;
     
-    // Add current directory to Python path
     {
         GILGuard gil;
         
@@ -67,13 +58,11 @@ bool PythonBridge::initialize(int det_size) {
         PyList_Append(sys_path, cwd);
         Py_DECREF(cwd);
         
-        // Also add parent directory
         PyObject* parent = PyUnicode_FromString(".");
         PyList_Append(sys_path, parent);
         Py_DECREF(parent);
     }
     
-    // Import ai_worker module
     {
         GILGuard gil;
         
@@ -86,7 +75,6 @@ bool PythonBridge::initialize(int det_size) {
             return false;
         }
         
-        // Get initialize function
         PyObject* init_func = PyObject_GetAttrString(module_, "initialize");
         if (!init_func || !PyCallable_Check(init_func)) {
             last_error_ = "ai_worker.initialize not found or not callable";
@@ -94,7 +82,6 @@ bool PythonBridge::initialize(int det_size) {
             return false;
         }
         
-        // Call initialize(det_size)
         std::cout << "[PythonBridge] Initializing InspireFace (det_size=" << det_size_ << ")..." << std::endl;
         
         PyObject* args = Py_BuildValue("(i)", det_size_);
@@ -110,7 +97,6 @@ bool PythonBridge::initialize(int det_size) {
         
         Py_DECREF(result);
         
-        // Get detect_faces function
         detect_func_ = PyObject_GetAttrString(module_, "detect_faces");
         if (!detect_func_ || !PyCallable_Check(detect_func_)) {
             last_error_ = "ai_worker.detect_faces not found or not callable";
@@ -127,22 +113,18 @@ bool PythonBridge::initialize(int det_size) {
 }
 
 PyObject* PythonBridge::cvMatToNumPy(const cv::Mat& frame) {
-    // CRITICAL: Frame must be continuous for zero-copy to work
     if (!frame.isContinuous()) {
         last_error_ = "Frame must be continuous for zero-copy conversion";
         return nullptr;
     }
     
-    // NumPy array dimensions: (height, width, channels)
     npy_intp dims[3] = {frame.rows, frame.cols, frame.channels()};
     
-    // Create NumPy array that SHARES memory with cv::Mat
-    // This is ZERO-COPY - no data is duplicated!
     PyObject* array = PyArray_SimpleNewFromData(
-        3,                  // 3D array
-        dims,              // Dimensions
-        NPY_UINT8,         // Data type
-        frame.data         // Pointer to data (SHARED!)
+        3,
+        dims,
+        NPY_UINT8,
+        frame.data
     );
     
     if (!array) {
@@ -150,8 +132,6 @@ PyObject* PythonBridge::cvMatToNumPy(const cv::Mat& frame) {
         return nullptr;
     }
     
-    // CRITICAL: Tell NumPy it doesn't own this memory
-    // Without this, NumPy might try to free frame.data when the array is destroyed!
     PyArray_CLEARFLAGS((PyArrayObject*)array, NPY_ARRAY_OWNDATA);
     
     return array;
@@ -169,16 +149,15 @@ bool PythonBridge::parseResults(PyObject* py_result, std::vector<DetectionResult
     results.reserve(num_faces);
     
     for (Py_ssize_t i = 0; i < num_faces; ++i) {
-        PyObject* face_dict = PyList_GetItem(py_result, i);  // Borrowed reference
+        PyObject* face_dict = PyList_GetItem(py_result, i);
         
         if (!PyDict_Check(face_dict)) {
-            continue;  // Skip invalid entries
+            continue;
         }
         
         DetectionResult det;
         
-        // Parse bbox: [x1, y1, x2, y2]
-        PyObject* bbox_list = PyDict_GetItemString(face_dict, "bbox");  // Borrowed ref
+        PyObject* bbox_list = PyDict_GetItemString(face_dict, "bbox");
         if (bbox_list && PyList_Check(bbox_list) && PyList_Size(bbox_list) == 4) {
             int x1 = PyLong_AsLong(PyList_GetItem(bbox_list, 0));
             int y1 = PyLong_AsLong(PyList_GetItem(bbox_list, 1));
@@ -187,8 +166,7 @@ bool PythonBridge::parseResults(PyObject* py_result, std::vector<DetectionResult
             det.bbox = cv::Rect(x1, y1, x2 - x1, y2 - y1);
         }
         
-        // Parse landmarks: [[x1,y1], [x2,y2], ...]
-        PyObject* kps_list = PyDict_GetItemString(face_dict, "kps");  // Borrowed ref
+        PyObject* kps_list = PyDict_GetItemString(face_dict, "kps");
         if (kps_list && PyList_Check(kps_list)) {
             Py_ssize_t num_kps = PyList_Size(kps_list);
             det.landmarks.reserve(num_kps);
@@ -203,12 +181,11 @@ bool PythonBridge::parseResults(PyObject* py_result, std::vector<DetectionResult
             }
         }
         
-        // Parse confidence (optional)
         PyObject* conf_obj = PyDict_GetItemString(face_dict, "conf");
         if (conf_obj) {
             det.confidence = PyFloat_AsDouble(conf_obj);
         } else {
-            det.confidence = 1.0f;  // Default
+            det.confidence = 1.0f;
         }
         
         results.push_back(det);
@@ -225,21 +202,16 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
     
     auto start = std::chrono::high_resolution_clock::now();
     
-    // Acquire GIL (RAII - automatically released on scope exit)
     GILGuard gil;
     
-    // Convert cv::Mat to NumPy (ZERO-COPY)
     PyObject* np_frame = cvMatToNumPy(frame);
     if (!np_frame) {
         return false;
     }
     
-    // Call detect_faces(frame)
     PyObject* args = PyTuple_Pack(1, np_frame);
     PyObject* py_result = PyObject_CallObject(detect_func_, args);
     
-    // Cleanup arguments (np_frame will be destroyed here, but that's OK
-    // because it doesn't own the data - frame.data is still valid)
     Py_DECREF(args);
     Py_DECREF(np_frame);
     
@@ -249,7 +221,6 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
         return false;
     }
     
-    // Parse results
     bool success = parseResults(py_result, results);
     Py_DECREF(py_result);
     
@@ -259,7 +230,6 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
     total_calls_++;
     total_time_ms_ += elapsed_ms;
     
-    // Log stats occasionally
     if (total_calls_ % 100 == 0) {
         double avg_ms = total_time_ms_ / total_calls_;
         std::cout << "[PythonBridge] Stats: " << total_calls_ << " calls, avg " 
@@ -292,7 +262,6 @@ void PythonBridge::setPythonError() {
 bool PythonBridge::restart(int det_size) {
     std::cout << "[PythonBridge] Restarting Python interpreter..." << std::endl;
     
-    // Clean up old state
     if (initialized_) {
         GILGuard gil;
         Py_XDECREF(detect_func_);
@@ -309,28 +278,20 @@ bool PythonBridge::restart(int det_size) {
     total_calls_ = 0;
     total_time_ms_ = 0.0;
     
-    // Re-initialize
     return initialize(det_size);
 }
-
-// ============================================================================
-// Drawing Utilities
-// ============================================================================
 
 void drawDetections(cv::Mat& frame, 
                    const std::vector<DetectionResult>& results,
                    const cv::Scalar& box_color,
                    const cv::Scalar& landmark_color) {
     for (const auto& det : results) {
-        // Draw bounding box (green, 2px)
         cv::rectangle(frame, det.bbox, box_color, 2);
         
-        // Draw landmarks (red circles, radius 3, filled)
         for (const auto& pt : det.landmarks) {
             cv::circle(frame, pt, 3, landmark_color, -1);
         }
         
-        // Optional: Draw confidence score
         if (det.confidence > 0.0f && det.confidence < 1.0f) {
             std::string conf_text = std::to_string(int(det.confidence * 100)) + "%";
             cv::putText(frame, conf_text, 
