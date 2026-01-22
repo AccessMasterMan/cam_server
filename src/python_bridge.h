@@ -28,18 +28,10 @@ struct DetectionResult {
 
 /**
  * PythonBridge - Thread-safe Python/C++ interface for face detection
- * 
- * Uses pybind11 for proper GIL management and memory safety.
- * 
- * CRITICAL: Uses PyEval_SaveThread/RestoreThread for GIL management
- * because storing gil_scoped_release in unique_ptr causes crashes.
- * 
- * Usage pattern:
- * 1. Create PythonBridge in main thread
- * 2. Call initialize() - this loads the AI model
- * 3. Call releaseGIL() to allow other threads to use Python
- * 4. Worker threads can now call detectFaces() safely
- * 5. Call restoreGIL() before destruction
+ * * ARCHITECTURE CHANGE FOR CUDA SAFETY:
+ * 1. Main Thread: Create bridge, Call releaseGIL()
+ * 2. Worker Thread: Call initialize() (Creates CUDA Context on worker), then detectFaces()
+ * 3. Main Thread: Call restoreGIL() before destruction
  */
 class PythonBridge {
 public:
@@ -52,7 +44,8 @@ public:
     
     /**
      * Initialize and load AI model
-     * Must be called from main thread before any other operations
+     * SAFE TO CALL FROM WORKER THREAD.
+     * Automatically acquires GIL internally.
      * @param det_size Detection input size (640 recommended)
      * @return true on success
      */
@@ -60,7 +53,7 @@ public:
     
     /**
      * Release GIL so other threads can use Python
-     * Must be called after initialize() and before worker threads start
+     * Must be called by MAIN thread immediately after construction
      */
     void releaseGIL();
     
@@ -80,7 +73,6 @@ public:
     bool detectFaces(const cv::Mat& frame, std::vector<DetectionResult>& results);
     
     bool isInitialized() const { return initialized_; }
-    bool isGILReleased() const { return gil_released_; }
     std::string getLastError() const { return last_error_; }
 
 private:
@@ -99,7 +91,7 @@ private:
     std::unique_ptr<py::module_> module_;
     std::unique_ptr<py::object> detect_func_;
     
-    // Thread state for GIL management (using raw API, NOT gil_scoped_release)
+    // Thread state for GIL management
     PyThreadState* saved_thread_state_;
     
     // Statistics
