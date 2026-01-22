@@ -31,11 +31,15 @@ struct DetectionResult {
  * 
  * Uses pybind11 for proper GIL management and memory safety.
  * 
+ * CRITICAL: Uses PyEval_SaveThread/RestoreThread for GIL management
+ * because storing gil_scoped_release in unique_ptr causes crashes.
+ * 
  * Usage pattern:
  * 1. Create PythonBridge in main thread
- * 2. Call initialize() - this starts the interpreter and loads the model
+ * 2. Call initialize() - this loads the AI model
  * 3. Call releaseGIL() to allow other threads to use Python
  * 4. Worker threads can now call detectFaces() safely
+ * 5. Call restoreGIL() before destruction
  */
 class PythonBridge {
 public:
@@ -47,7 +51,7 @@ public:
     PythonBridge& operator=(const PythonBridge&) = delete;
     
     /**
-     * Initialize Python interpreter and load AI model
+     * Initialize and load AI model
      * Must be called from main thread before any other operations
      * @param det_size Detection input size (640 recommended)
      * @return true on success
@@ -61,6 +65,12 @@ public:
     void releaseGIL();
     
     /**
+     * Restore GIL before shutdown
+     * Must be called before PythonBridge destruction
+     */
+    void restoreGIL();
+    
+    /**
      * Detect faces in a frame (thread-safe)
      * Automatically acquires/releases GIL
      * @param frame Input BGR frame
@@ -70,6 +80,7 @@ public:
     bool detectFaces(const cv::Mat& frame, std::vector<DetectionResult>& results);
     
     bool isInitialized() const { return initialized_; }
+    bool isGILReleased() const { return gil_released_; }
     std::string getLastError() const { return last_error_; }
 
 private:
@@ -80,6 +91,7 @@ private:
     bool parseResults(const py::list& py_result, std::vector<DetectionResult>& results);
     
     bool initialized_;
+    bool gil_released_;
     int det_size_;
     std::string last_error_;
     
@@ -87,8 +99,8 @@ private:
     std::unique_ptr<py::module_> module_;
     std::unique_ptr<py::object> detect_func_;
     
-    // GIL release guard (kept alive to keep GIL released)
-    std::unique_ptr<py::gil_scoped_release> gil_release_;
+    // Thread state for GIL management (using raw API, NOT gil_scoped_release)
+    PyThreadState* saved_thread_state_;
     
     // Statistics
     uint64_t total_calls_;

@@ -1,10 +1,14 @@
 // python_bridge.cpp - pybind11-based Python Bridge Implementation
 // 
-// This implementation uses pybind11 for:
-// - Automatic reference counting
-// - Safe GIL management
-// - Clean numpy array handling
-// - Exception-safe Python calls
+// CRITICAL FIX: Uses PyEval_SaveThread/RestoreThread directly instead of
+// storing gil_scoped_release in unique_ptr, which causes crashes.
+//
+// Correct pattern from pybind11 GitHub discussions:
+// 1. Initialize interpreter
+// 2. Do initialization work  
+// 3. PyEval_SaveThread() to release GIL
+// 4. Worker threads use gil_scoped_acquire
+// 5. PyEval_RestoreThread() before shutdown
 
 #include "python_bridge.h"
 #include <iostream>
@@ -14,26 +18,27 @@ namespace FaceStreaming {
 
 PythonBridge::PythonBridge()
     : initialized_(false)
+    , gil_released_(false)
     , det_size_(640)
     , module_(nullptr)
     , detect_func_(nullptr)
-    , gil_release_(nullptr)
+    , saved_thread_state_(nullptr)
     , total_calls_(0)
     , total_time_ms_(0.0)
 {
 }
 
 PythonBridge::~PythonBridge() {
-    // Destructor must acquire GIL before destroying Python objects
-    if (initialized_ && gil_release_) {
-        // Reset the GIL release to re-acquire GIL
-        gil_release_.reset();
-        
-        // Now we can safely destroy Python objects
-        detect_func_.reset();
-        module_.reset();
+    // Restore GIL if it was released (should be called explicitly before this)
+    if (gil_released_ && saved_thread_state_) {
+        std::cerr << "[PythonBridge] WARNING: GIL not restored before destruction!" << std::endl;
+        PyEval_RestoreThread(saved_thread_state_);
+        gil_released_ = false;
     }
-    // Note: py::scoped_interpreter in main() handles Py_Finalize
+    
+    // Now safe to destroy Python objects
+    detect_func_.reset();
+    module_.reset();
 }
 
 bool PythonBridge::initialize(int det_size) {
@@ -82,11 +87,37 @@ bool PythonBridge::initialize(int det_size) {
 }
 
 void PythonBridge::releaseGIL() {
-    if (initialized_ && !gil_release_) {
-        std::cout << "[PythonBridge] Releasing GIL for multi-threaded access..." << std::endl;
-        gil_release_ = std::make_unique<py::gil_scoped_release>();
-        std::cout << "[PythonBridge] ✓ GIL released" << std::endl;
+    if (!initialized_) {
+        std::cerr << "[PythonBridge] Cannot release GIL - not initialized" << std::endl;
+        return;
     }
+    
+    if (gil_released_) {
+        std::cout << "[PythonBridge] GIL already released" << std::endl;
+        return;
+    }
+    
+    std::cout << "[PythonBridge] Releasing GIL for multi-threaded access..." << std::endl;
+    
+    // CRITICAL: Use PyEval_SaveThread directly, NOT gil_scoped_release in unique_ptr
+    // This is the correct pattern from pybind11 documentation
+    saved_thread_state_ = PyEval_SaveThread();
+    gil_released_ = true;
+    
+    std::cout << "[PythonBridge] ✓ GIL released (thread state saved)" << std::endl;
+}
+
+void PythonBridge::restoreGIL() {
+    if (!gil_released_ || !saved_thread_state_) {
+        std::cout << "[PythonBridge] GIL not released or already restored" << std::endl;
+        return;
+    }
+    
+    std::cout << "[PythonBridge] Restoring GIL..." << std::endl;
+    PyEval_RestoreThread(saved_thread_state_);
+    saved_thread_state_ = nullptr;
+    gil_released_ = false;
+    std::cout << "[PythonBridge] ✓ GIL restored" << std::endl;
 }
 
 py::array_t<uint8_t> PythonBridge::cvMatToNumpy(const cv::Mat& frame) {
@@ -177,6 +208,7 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
     
     try {
         // Acquire GIL for Python operations
+        // This works correctly when main thread has called PyEval_SaveThread
         py::gil_scoped_acquire acquire;
         
         // Convert cv::Mat to numpy array (zero-copy)

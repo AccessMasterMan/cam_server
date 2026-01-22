@@ -641,6 +641,14 @@ int main() {
     // ========================================================================
     py_bridge.releaseGIL();
     
+    // CRITICAL: Do an acquire-release cycle from main thread before threads use GIL
+    // This is required to properly initialize pybind11 internals for thread safety
+    // (See pybind11 GitHub issue #1273)
+    {
+        py::gil_scoped_acquire acquire;
+        std::cout << "[Server] GIL acquire-release cycle completed" << std::endl;
+    }
+    
     // Allow pipelines to stabilize
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     g_pipelines_ready = true;
@@ -775,6 +783,9 @@ int main() {
     
     g_decoder.cleanup();
     g_encoder.cleanup();
+    
+    // CRITICAL: Restore GIL before destroying Python objects
+    py_bridge.restoreGIL();
     
     srt_close(listen_socket);
     srt_cleanup();
