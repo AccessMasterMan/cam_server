@@ -1,247 +1,152 @@
-// python_bridge.cpp - Zero-Copy Python Bridge Implementation (FIXED VERSION)
+// python_bridge.cpp - pybind11-based Python Bridge Implementation
 // 
-// CRITICAL FIX: Proper GIL management for multi-threaded applications
-// 
-// The key issue was that after Py_Initialize(), the main thread holds the GIL.
-// We MUST release it with PyEval_SaveThread() so other threads can acquire it
-// using PyGILState_Ensure()/PyGILState_Release().
+// This implementation uses pybind11 for:
+// - Automatic reference counting
+// - Safe GIL management
+// - Clean numpy array handling
+// - Exception-safe Python calls
 
 #include "python_bridge.h"
 #include <iostream>
-#include <sstream>
 #include <chrono>
 
 namespace FaceStreaming {
 
-// Helper function for NumPy import - must be in a function context
-static void* init_numpy() {
-    import_array();
-    return nullptr;
-}
-
 PythonBridge::PythonBridge()
-    : module_(nullptr)
-    , detect_func_(nullptr)
-    , initialized_(false)
+    : initialized_(false)
     , det_size_(640)
-    , main_thread_state_(nullptr)
+    , module_(nullptr)
+    , detect_func_(nullptr)
+    , gil_release_(nullptr)
     , total_calls_(0)
     , total_time_ms_(0.0)
 {
 }
 
 PythonBridge::~PythonBridge() {
-    if (initialized_) {
-        // Re-acquire GIL for cleanup
-        PyEval_RestoreThread(main_thread_state_);
+    // Destructor must acquire GIL before destroying Python objects
+    if (initialized_ && gil_release_) {
+        // Reset the GIL release to re-acquire GIL
+        gil_release_.reset();
         
-        Py_XDECREF(detect_func_);
-        Py_XDECREF(module_);
-        
-        if (Py_IsInitialized()) {
-            Py_Finalize();
-        }
+        // Now we can safely destroy Python objects
+        detect_func_.reset();
+        module_.reset();
     }
+    // Note: py::scoped_interpreter in main() handles Py_Finalize
 }
 
 bool PythonBridge::initialize(int det_size) {
     det_size_ = det_size;
     
-    std::cout << "[PythonBridge] Initializing Python environment..." << std::endl;
+    std::cout << "[PythonBridge] Initializing with pybind11..." << std::endl;
     
-    // Initialize Python interpreter
-    Py_Initialize();
-    
-    if (!Py_IsInitialized()) {
-        last_error_ = "Failed to initialize Python interpreter";
-        return false;
-    }
-    std::cout << "[PythonBridge] Python interpreter initialized" << std::endl;
-    
-    // Initialize thread support
-    // Note: In Python 3.7+, this is automatically done by Py_Initialize()
-    // but we call it explicitly for compatibility
-    std::cout << "[PythonBridge] Initializing thread support..." << std::endl;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    if (!PyEval_ThreadsInitialized()) {
-        PyEval_InitThreads();
-    }
-#pragma GCC diagnostic pop
-    std::cout << "[PythonBridge] Thread support enabled" << std::endl;
-    
-    // Import NumPy C API - this must happen while we hold the GIL
-    std::cout << "[PythonBridge] Importing NumPy C API..." << std::endl;
-    init_numpy();
-    
-    if (PyErr_Occurred()) {
-        PyErr_Print();
-        last_error_ = "Failed to import NumPy";
-        return false;
-    }
-    
-    std::cout << "[PythonBridge] Python " << Py_GetVersion() << std::endl;
-    std::cout << "[PythonBridge] NumPy C API imported successfully" << std::endl;
-    
-    // Add paths to sys.path (still holding GIL from Py_Initialize)
-    std::cout << "[PythonBridge] Adding paths to sys.path..." << std::endl;
-    PyObject* sys_path = PySys_GetObject("path");
-    if (sys_path) {
-        PyObject* cwd = PyUnicode_FromString("./src");
-        PyList_Append(sys_path, cwd);
-        Py_DECREF(cwd);
-        std::cout << "[PythonBridge]   Added: ./src" << std::endl;
+    try {
+        // Add current directory and src to Python path
+        std::cout << "[PythonBridge] Adding paths to sys.path..." << std::endl;
+        py::module_ sys = py::module_::import("sys");
+        py::list path = sys.attr("path");
+        path.append(".");
+        path.append("./src");
+        std::cout << "[PythonBridge]   Added: . and ./src" << std::endl;
         
-        PyObject* parent = PyUnicode_FromString(".");
-        PyList_Append(sys_path, parent);
-        Py_DECREF(parent);
-        std::cout << "[PythonBridge]   Added: ." << std::endl;
-    }
-    
-    // Load ai_worker module
-    std::cout << "[PythonBridge] Loading ai_worker module..." << std::endl;
-    
-    module_ = PyImport_ImportModule("ai_worker");
-    if (!module_) {
-        setPythonError();
-        PyErr_Print();
+        // Import the ai_worker module
+        std::cout << "[PythonBridge] Loading ai_worker module..." << std::endl;
+        module_ = std::make_unique<py::module_>(py::module_::import("ai_worker"));
+        std::cout << "[PythonBridge] ✓ ai_worker module loaded" << std::endl;
+        
+        // Get the initialize function and call it
+        std::cout << "[PythonBridge] Calling ai_worker.initialize(det_size=" << det_size_ << ")..." << std::endl;
+        py::object init_func = module_->attr("initialize");
+        init_func(det_size_);
+        std::cout << "[PythonBridge] ✓ ai_worker.initialize() completed" << std::endl;
+        
+        // Get the detect_faces function
+        detect_func_ = std::make_unique<py::object>(module_->attr("detect_faces"));
+        std::cout << "[PythonBridge] ✓ detect_faces function acquired" << std::endl;
+        
+        std::cout << "[PythonBridge] ✓ AI engine initialized successfully!" << std::endl;
+        
+        initialized_ = true;
+        return true;
+        
+    } catch (const py::error_already_set& e) {
+        last_error_ = std::string("Python error: ") + e.what();
+        std::cerr << "[PythonBridge] " << last_error_ << std::endl;
+        return false;
+    } catch (const std::exception& e) {
+        last_error_ = std::string("Exception: ") + e.what();
+        std::cerr << "[PythonBridge] " << last_error_ << std::endl;
         return false;
     }
-    std::cout << "[PythonBridge] ✓ ai_worker module loaded" << std::endl;
-    
-    // Get initialize function
-    PyObject* init_func = PyObject_GetAttrString(module_, "initialize");
-    if (!init_func || !PyCallable_Check(init_func)) {
-        last_error_ = "ai_worker.initialize not found or not callable";
-        Py_XDECREF(init_func);
-        return false;
-    }
-    std::cout << "[PythonBridge] ✓ initialize function found" << std::endl;
-    
-    // Call initialize
-    std::cout << "[PythonBridge] Calling ai_worker.initialize(det_size=" << det_size_ << ")..." << std::endl;
-    
-    PyObject* args = Py_BuildValue("(i)", det_size_);
-    PyObject* result = PyObject_CallObject(init_func, args);
-    Py_DECREF(args);
-    Py_DECREF(init_func);
-    
-    if (!result) {
-        setPythonError();
-        PyErr_Print();
-        return false;
-    }
-    Py_DECREF(result);
-    std::cout << "[PythonBridge] ✓ ai_worker.initialize() completed" << std::endl;
-    
-    // Get detect_faces function
-    detect_func_ = PyObject_GetAttrString(module_, "detect_faces");
-    if (!detect_func_ || !PyCallable_Check(detect_func_)) {
-        last_error_ = "ai_worker.detect_faces not found or not callable";
-        Py_XDECREF(detect_func_);
-        detect_func_ = nullptr;
-        return false;
-    }
-    std::cout << "[PythonBridge] ✓ detect_faces function found" << std::endl;
-    
-    std::cout << "[PythonBridge] ✓ AI engine initialized successfully!" << std::endl;
-    
-    // CRITICAL FIX: Release the GIL so other threads can use Python
-    // This is the key fix - without this, other threads calling PyGILState_Ensure()
-    // will deadlock or crash because the main thread still holds the GIL
-    main_thread_state_ = PyEval_SaveThread();
-    
-    initialized_ = true;
-    return true;
 }
 
-PyObject* PythonBridge::cvMatToNumPy(const cv::Mat& frame) {
-    // This function must be called while holding the GIL
-    
-    if (!frame.isContinuous()) {
-        last_error_ = "Frame must be continuous for zero-copy conversion";
-        return nullptr;
+void PythonBridge::releaseGIL() {
+    if (initialized_ && !gil_release_) {
+        std::cout << "[PythonBridge] Releasing GIL for multi-threaded access..." << std::endl;
+        gil_release_ = std::make_unique<py::gil_scoped_release>();
+        std::cout << "[PythonBridge] ✓ GIL released" << std::endl;
     }
+}
+
+py::array_t<uint8_t> PythonBridge::cvMatToNumpy(const cv::Mat& frame) {
+    // Create a numpy array that shares memory with cv::Mat
+    // Shape: (height, width, channels)
+    std::vector<ssize_t> shape = {frame.rows, frame.cols, frame.channels()};
+    std::vector<ssize_t> strides = {
+        static_cast<ssize_t>(frame.step[0]),  // bytes per row
+        static_cast<ssize_t>(frame.step[1]),  // bytes per pixel
+        static_cast<ssize_t>(frame.elemSize1()) // bytes per channel
+    };
     
-    if (frame.empty()) {
-        last_error_ = "Frame is empty";
-        return nullptr;
-    }
-    
-    npy_intp dims[3] = {frame.rows, frame.cols, frame.channels()};
-    
-    // Create NumPy array that SHARES memory with cv::Mat (zero-copy)
-    PyObject* array = PyArray_SimpleNewFromData(
-        3,                  // 3D array
-        dims,              // Dimensions
-        NPY_UINT8,         // Data type
-        frame.data         // Pointer to data (SHARED!)
+    // Create array without copying data (shares memory with cv::Mat)
+    return py::array_t<uint8_t>(
+        shape,
+        strides,
+        frame.data,
+        py::none()  // No base object - we manage the lifetime
     );
-    
-    if (!array) {
-        last_error_ = "Failed to create NumPy array from cv::Mat";
-        return nullptr;
-    }
-    
-    // CRITICAL: Tell NumPy it doesn't own this memory
-    // Without this, NumPy might try to free frame.data when the array is destroyed!
-    PyArray_CLEARFLAGS((PyArrayObject*)array, NPY_ARRAY_OWNDATA);
-    
-    return array;
 }
 
-bool PythonBridge::parseResults(PyObject* py_result, std::vector<DetectionResult>& results) {
-    // This function must be called while holding the GIL
-    
+bool PythonBridge::parseResults(const py::list& py_result, std::vector<DetectionResult>& results) {
     results.clear();
+    results.reserve(py::len(py_result));
     
-    if (!PyList_Check(py_result)) {
-        last_error_ = "Python result is not a list";
-        return false;
-    }
-    
-    Py_ssize_t num_faces = PyList_Size(py_result);
-    results.reserve(num_faces);
-    
-    for (Py_ssize_t i = 0; i < num_faces; ++i) {
-        PyObject* face_dict = PyList_GetItem(py_result, i);  // Borrowed reference
-        
-        if (!PyDict_Check(face_dict)) {
-            continue;
-        }
+    for (size_t i = 0; i < py::len(py_result); ++i) {
+        py::dict face_dict = py_result[i].cast<py::dict>();
         
         DetectionResult det;
         
         // Parse bbox
-        PyObject* bbox_list = PyDict_GetItemString(face_dict, "bbox");  // Borrowed
-        if (bbox_list && PyList_Check(bbox_list) && PyList_Size(bbox_list) == 4) {
-            int x1 = PyLong_AsLong(PyList_GetItem(bbox_list, 0));
-            int y1 = PyLong_AsLong(PyList_GetItem(bbox_list, 1));
-            int x2 = PyLong_AsLong(PyList_GetItem(bbox_list, 2));
-            int y2 = PyLong_AsLong(PyList_GetItem(bbox_list, 3));
-            det.bbox = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+        if (face_dict.contains("bbox")) {
+            py::list bbox = face_dict["bbox"].cast<py::list>();
+            if (py::len(bbox) == 4) {
+                int x1 = bbox[0].cast<int>();
+                int y1 = bbox[1].cast<int>();
+                int x2 = bbox[2].cast<int>();
+                int y2 = bbox[3].cast<int>();
+                det.bbox = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+            }
         }
         
         // Parse landmarks
-        PyObject* kps_list = PyDict_GetItemString(face_dict, "kps");  // Borrowed
-        if (kps_list && PyList_Check(kps_list)) {
-            Py_ssize_t num_kps = PyList_Size(kps_list);
-            det.landmarks.reserve(num_kps);
+        if (face_dict.contains("kps")) {
+            py::list kps = face_dict["kps"].cast<py::list>();
+            det.landmarks.reserve(py::len(kps));
             
-            for (Py_ssize_t j = 0; j < num_kps; ++j) {
-                PyObject* point_list = PyList_GetItem(kps_list, j);  // Borrowed
-                if (PyList_Check(point_list) && PyList_Size(point_list) == 2) {
-                    float x = PyFloat_AsDouble(PyList_GetItem(point_list, 0));
-                    float y = PyFloat_AsDouble(PyList_GetItem(point_list, 1));
+            for (size_t j = 0; j < py::len(kps); ++j) {
+                py::list point = kps[j].cast<py::list>();
+                if (py::len(point) == 2) {
+                    float x = point[0].cast<float>();
+                    float y = point[1].cast<float>();
                     det.landmarks.emplace_back(x, y);
                 }
             }
         }
         
         // Parse confidence
-        PyObject* conf_obj = PyDict_GetItemString(face_dict, "conf");  // Borrowed
-        if (conf_obj) {
-            det.confidence = PyFloat_AsDouble(conf_obj);
+        if (face_dict.contains("conf")) {
+            det.confidence = face_dict["conf"].cast<float>();
         } else {
             det.confidence = 1.0f;
         }
@@ -263,42 +168,38 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
         return false;
     }
     
+    if (!frame.isContinuous()) {
+        last_error_ = "Frame must be continuous";
+        return false;
+    }
+    
     auto start = std::chrono::high_resolution_clock::now();
     
-    // Acquire GIL for Python operations
-    // This is thread-safe because we released the GIL in initialize()
-    GILGuard gil;
-    
-    // Create numpy array from frame (zero-copy)
-    PyObject* np_frame = cvMatToNumPy(frame);
-    if (!np_frame) {
+    try {
+        // Acquire GIL for Python operations
+        py::gil_scoped_acquire acquire;
+        
+        // Convert cv::Mat to numpy array (zero-copy)
+        py::array_t<uint8_t> np_frame = cvMatToNumpy(frame);
+        
+        // Call detect_faces
+        py::object py_result = (*detect_func_)(np_frame);
+        
+        // Parse results
+        py::list result_list = py_result.cast<py::list>();
+        if (!parseResults(result_list, results)) {
+            return false;
+        }
+        
+    } catch (const py::error_already_set& e) {
+        last_error_ = std::string("Python error: ") + e.what();
+        std::cerr << "[PythonBridge] " << last_error_ << std::endl;
+        return false;
+    } catch (const std::exception& e) {
+        last_error_ = std::string("Exception: ") + e.what();
+        std::cerr << "[PythonBridge] " << last_error_ << std::endl;
         return false;
     }
-    
-    // Create argument tuple
-    PyObject* args = PyTuple_Pack(1, np_frame);
-    if (!args) {
-        Py_DECREF(np_frame);
-        last_error_ = "Failed to create argument tuple";
-        return false;
-    }
-    
-    // Call detect_faces
-    PyObject* py_result = PyObject_CallObject(detect_func_, args);
-    
-    // Clean up arguments
-    Py_DECREF(args);
-    Py_DECREF(np_frame);
-    
-    if (!py_result) {
-        setPythonError();
-        PyErr_Print();
-        return false;
-    }
-    
-    // Parse results
-    bool success = parseResults(py_result, results);
-    Py_DECREF(py_result);
     
     auto end = std::chrono::high_resolution_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -314,52 +215,7 @@ bool PythonBridge::detectFaces(const cv::Mat& frame, std::vector<DetectionResult
                   << avg_ms << " ms/frame" << std::endl;
     }
     
-    return success;
-}
-
-void PythonBridge::setPythonError() {
-    PyObject *type, *value, *traceback;
-    PyErr_Fetch(&type, &value, &traceback);
-    
-    if (value) {
-        PyObject* str = PyObject_Str(value);
-        if (str) {
-            const char* err_msg = PyUnicode_AsUTF8(str);
-            if (err_msg) {
-                last_error_ = err_msg;
-            }
-            Py_DECREF(str);
-        }
-    }
-    
-    Py_XDECREF(type);
-    Py_XDECREF(value);
-    Py_XDECREF(traceback);
-}
-
-bool PythonBridge::restart(int det_size) {
-    std::cout << "[PythonBridge] Restarting Python interpreter..." << std::endl;
-    
-    if (initialized_) {
-        // Re-acquire GIL for cleanup
-        PyEval_RestoreThread(main_thread_state_);
-        
-        Py_XDECREF(detect_func_);
-        Py_XDECREF(module_);
-        detect_func_ = nullptr;
-        module_ = nullptr;
-        
-        if (Py_IsInitialized()) {
-            Py_Finalize();
-        }
-    }
-    
-    initialized_ = false;
-    total_calls_ = 0;
-    total_time_ms_ = 0.0;
-    main_thread_state_ = nullptr;
-    
-    return initialize(det_size);
+    return true;
 }
 
 void drawDetections(cv::Mat& frame, 

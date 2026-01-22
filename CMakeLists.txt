@@ -1,21 +1,44 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 project(srt_ai_server VERSION 1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Default to Release build
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
+# Compiler flags
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -DNDEBUG")
 
 # ============================================================================
-# Find Python3
+# Find pybind11 (REQUIRED for embedding Python)
+# ============================================================================
+# Try to find pybind11 via pip install location first
+execute_process(
+    COMMAND python3 -c "import pybind11; print(pybind11.get_cmake_dir())"
+    OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+if(PYBIND11_CMAKE_DIR)
+    list(APPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKE_DIR}")
+    message(STATUS "Found pybind11 via pip: ${PYBIND11_CMAKE_DIR}")
+endif()
+
+find_package(pybind11 CONFIG REQUIRED)
+message(STATUS "pybind11: ${pybind11_VERSION}")
+message(STATUS "pybind11 include: ${pybind11_INCLUDE_DIRS}")
+
+# ============================================================================
+# Find Python3 (for NumPy headers)
 # ============================================================================
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
-
 message(STATUS "Python3: ${Python3_VERSION}")
 message(STATUS "  Include: ${Python3_INCLUDE_DIRS}")
 message(STATUS "  NumPy: ${Python3_NumPy_INCLUDE_DIRS}")
@@ -24,7 +47,6 @@ message(STATUS "  NumPy: ${Python3_NumPy_INCLUDE_DIRS}")
 # Find OpenCV
 # ============================================================================
 find_package(OpenCV REQUIRED)
-
 message(STATUS "OpenCV: ${OpenCV_VERSION}")
 
 # ============================================================================
@@ -34,9 +56,8 @@ find_library(SRT_LIBRARY srt)
 find_path(SRT_INCLUDE_DIR srt/srt.h)
 
 if(NOT SRT_LIBRARY OR NOT SRT_INCLUDE_DIR)
-    message(FATAL_ERROR "SRT library not found")
+    message(FATAL_ERROR "SRT library not found. Install with: apt install libsrt-dev")
 endif()
-
 message(STATUS "SRT: ${SRT_LIBRARY}")
 
 # ============================================================================
@@ -46,7 +67,6 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0>=1.14)
 pkg_check_modules(GSTREAMER_APP REQUIRED gstreamer-app-1.0>=1.14)
 pkg_check_modules(GSTREAMER_VIDEO REQUIRED gstreamer-video-1.0>=1.14)
-
 message(STATUS "GStreamer: ${GSTREAMER_VERSION}")
 
 # ============================================================================
@@ -82,9 +102,10 @@ add_executable(srt_ai_server ${SOURCES} ${HEADERS})
 
 # ============================================================================
 # Link Libraries
+# CRITICAL: Use pybind11::embed for embedding Python interpreter
 # ============================================================================
-target_link_libraries(srt_ai_server
-    ${Python3_LIBRARIES}
+target_link_libraries(srt_ai_server PRIVATE
+    pybind11::embed
     ${OpenCV_LIBS}
     ${SRT_LIBRARY}
     ${GSTREAMER_LIBRARIES}
@@ -94,17 +115,14 @@ target_link_libraries(srt_ai_server
 )
 
 # ============================================================================
-# Copy Python Module to Multiple Locations
+# Copy Python Module
 # ============================================================================
-
-# Copy to build root (for direct execution)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_worker.py
     ${CMAKE_CURRENT_BINARY_DIR}/ai_worker.py
     COPYONLY
 )
 
-# Also create src directory in build and copy there
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/src)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_worker.py
@@ -112,23 +130,29 @@ configure_file(
     COPYONLY
 )
 
-# Create a symlink in project root for convenience (optional, won't fail if exists)
-execute_process(
-    COMMAND ${CMAKE_COMMAND} -E create_symlink 
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_worker.py
-        ${CMAKE_CURRENT_SOURCE_DIR}/ai_worker.py
-    ERROR_QUIET
-)
+# Create TensorRT cache directory
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/trt_cache)
 
+# ============================================================================
+# Print Build Summary
+# ============================================================================
 message(STATUS "")
-message(STATUS "╔═══════════════════════════════════════════╗")
-message(STATUS "║  SRT AI Server - Ready to Build          ║")
-message(STATUS "╚═══════════════════════════════════════════╝")
+message(STATUS "╔═══════════════════════════════════════════════════════════╗")
+message(STATUS "║  SRT AI Server (pybind11) - Build Configuration           ║")
+message(STATUS "╚═══════════════════════════════════════════════════════════╝")
 message(STATUS "")
-message(STATUS "Build: make -j$(nproc)")
-message(STATUS "Run:   ./srt_ai_server")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "")
-message(STATUS "Python module will be available at:")
-message(STATUS "  - ${CMAKE_CURRENT_BINARY_DIR}/ai_worker.py")
-message(STATUS "  - ${CMAKE_CURRENT_BINARY_DIR}/src/ai_worker.py")
+message(STATUS "Dependencies:")
+message(STATUS "  pybind11:   ${pybind11_VERSION}")
+message(STATUS "  Python:     ${Python3_VERSION}")
+message(STATUS "  OpenCV:     ${OpenCV_VERSION}")
+message(STATUS "  GStreamer:  ${GSTREAMER_VERSION}")
+message(STATUS "  SRT:        Found")
+message(STATUS "")
+message(STATUS "Build commands:")
+message(STATUS "  mkdir build && cd build")
+message(STATUS "  cmake ..")
+message(STATUS "  make -j$(nproc)")
+message(STATUS "  ./srt_ai_server")
 message(STATUS "")
